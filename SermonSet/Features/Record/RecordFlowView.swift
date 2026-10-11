@@ -36,8 +36,11 @@ struct RecordFlowView: View {
             } else if capture.isActive {
                 LiveRecordingView(dimmed: $dimmed, onSaved: { sermon in
                     withAnimation { saved = sermon }
+                    // Notes and the automatic Voice Focus copy run together; Voice Focus alone if notes are off.
                     if store.summarizeAfterRecording {
                         Task { await store.processRecording(sermonID: sermon.id) }
+                    } else if store.voiceFocusAfterRecording {
+                        Task { await store.processVoiceFocusAfterRecording(sermonID: sermon.id) }
                     }
                 })
             } else {

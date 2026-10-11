@@ -4,7 +4,10 @@ import Observation
 @MainActor @Observable public final class SermonStore {
     var document = StoreDocument()
     public private(set) var lastError: SermonSetError?
-    public internal(set) var capabilities = CapabilityReport(speechTranscription: .unavailable(reason: "Checking on-device speech availability."), onDeviceLanguageModel: .unavailable(reason: "Checking on-device model availability."))
+    public internal(set) var capabilities = CapabilityReport(speechTranscription: .unavailable(reason: "Checking on-device speech availability."), onDeviceLanguageModel: .unavailable(reason: "Checking on-device model availability.")) {
+        didSet { capabilityRevision &+= 1 }
+    }
+    @ObservationIgnored var capabilityRevision = 0
     @ObservationIgnored var transcriptionAdapter: any TranscriptionAdapter = SpeechAnalyzerAdapter()
     @ObservationIgnored var parakeetTranscriptionFactory: (@MainActor @Sendable (String) -> any TranscriptionAdapter)?
     public internal(set) var transcriptionFallbackReason: String?
@@ -16,7 +19,15 @@ import Observation
     @ObservationIgnored var notesStageSermonID: UUID?
     @ObservationIgnored var recordingTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored var recordingBackground: [UUID: RecordingProcessingBackground] = [:]
+    @ObservationIgnored var voiceFocusTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored var voiceFocusRenderRequests: [UUID: UUID] = [:]
+    @ObservationIgnored var voiceFocusRender: @Sendable (URL, URL, AudioTrimWindow, Double, Bool, Double) async throws -> (AudioFileInfo, VoiceFocusDiagnostics) = { source, destination, trim, strength, music, gain in
+        try await VoiceFocusRenderer.render(source: source, destination: destination, trim: trim, strength: strength, processMusic: music, gainDB: gain)
+    }
     @ObservationIgnored var processingForegroundObserver: (any NSObjectProtocol)?
+    @ObservationIgnored var voiceFocusPreviewTask: Task<VoiceFocusPreview, any Error>?
+    @ObservationIgnored var voiceFocusPreviewRequest: UUID?
+    @ObservationIgnored let voiceFocusAnalysis = VoiceFocusAnalysisCache()
     var processingJobs: [UUID: ProcessingJobs] = [:]
     @ObservationIgnored let configuration: StoreConfiguration
     @ObservationIgnored let root: URL
@@ -43,6 +54,8 @@ import Observation
             persistent = false
         case let .uiTest(directory): root = directory; persistent = true
         }
+        // Preview audio is disposable, including files left by a terminated app.
+        try? FileManager.default.removeItem(at: voiceFocusPreviewDirectory)
         do {
             try LocalFiles.createDirectory(root)
             try LocalFiles.createDirectory(recordingsDirectory)
@@ -68,6 +81,7 @@ import Observation
     }
 
     isolated deinit {
+        voiceFocusPreviewTask?.cancel()
         if let observer = processingForegroundObserver { NotificationCenter.default.removeObserver(observer) }
     }
 
@@ -151,6 +165,8 @@ import Observation
     }
     static func remove(_ id: UUID, from state: inout StoreDocument) {
         state.pendingRecordingProcessing?.remove(id)
+        state.pendingVoiceFocusRecordings?.remove(id)
+        state.features?.preferredListeningAssets?[id] = nil
         state.sermons[id] = nil; state.history[id] = nil; state.editions[id] = nil; state.transcripts[id] = nil; state.insights[id] = nil
         state.cards = state.cards.filter { $0.value.sermonID != id }; state.moments = state.moments.filter { $0.value.sermonID != id }; state.notes = state.notes.filter { $0.value.sermonID != id }
         let assets = state.audio.values.filter { $0.sermonID == id }.map(\.id)
@@ -170,6 +186,7 @@ import Observation
         let sessionFiles = document.finalizedSessions.filter { $0.value == id }.keys.map { sessionsDirectory.appendingPathComponent($0.uuidString) }
         try transaction { Self.remove(id, from: &$0) }
         recordingTasks[id]?.cancel(); recordingBackground[id]?.finish(success: false)
+        voiceFocusTasks[id]?.cancel(); voiceFocusRenderRequests[id] = nil
         processingJobs[id] = nil
         AudioSessionCoordinator.libraryDidRemove(root: root, sermonID: id)
         do { for path in paths { let url = recordingsDirectory.appendingPathComponent(path); if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) } }; for url in jobFiles + sessionFiles where FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) } }
@@ -246,6 +263,7 @@ import Observation
             throw report(SermonSetError(title: "Recording is active", message: "Finish or discard the current recording before erasing the library."))
         }
         for task in recordingTasks.values { task.cancel() }; for lease in recordingBackground.values { lease.finish(success: false) }
+        for task in voiceFocusTasks.values { task.cancel() }; voiceFocusRenderRequests = [:]
         AudioSessionCoordinator.libraryDidRemove(root: root, sermonID: nil)
         do {
             if FileManager.default.fileExists(atPath: exportsDirectory.path) { try FileManager.default.removeItem(at: exportsDirectory) }

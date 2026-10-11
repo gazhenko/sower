@@ -54,7 +54,12 @@ struct AudioToolsSheet: View {
                 strength = provenance.strength * 100
                 leaveMusic = !provenance.processMusic
             }
-            listening = playback.nowPlayingSermonID == sermon.id && playback.activeAssetKind == .enhanced ? .enhanced : .original
+            // Reflect what the player will actually use: the remembered choice, which defaults to the Voice Focus copy.
+            if playback.nowPlayingSermonID == sermon.id, let kind = playback.activeAssetKind {
+                listening = kind == .enhanced ? .enhanced : .original
+            } else {
+                listening = store.preferredListeningAsset(for: sermon.id)?.kind == .enhanced ? .enhanced : .original
+            }
         }
     }
 
@@ -94,6 +99,21 @@ struct AudioToolsSheet: View {
             }
             .tint(look.palette.accent)
 
+            if let enhanced, store.derivativeProvenance(for: enhanced.id)?.madeAutomatically == true {
+                Label("Made for you after recording at \(Int((store.derivativeProvenance(for: enhanced.id)?.strength ?? 0.5) * 100))%. Your original is kept.", systemImage: "sparkles")
+                    .font(look.type.caption)
+                    .foregroundStyle(look.palette.inkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if store.jobs(for: sermon.id).voiceFocus.isRunning {
+                HStack(spacing: 10) {
+                    ProgressView().tint(look.palette.accent)
+                    Text("Making your Voice Focus copy…").font(look.type.headline).foregroundStyle(look.palette.ink)
+                }
+            } else if source != nil {
+                VoiceFocusPreviewCard(sermon: sermon, strength: strength, leaveMusic: leaveMusic, hasCopy: enhanced != nil)
+            }
+
             renderControl
 
             if let enhanced {
@@ -125,8 +145,14 @@ struct AudioToolsSheet: View {
         case .unavailable(let reason):
             Label(reason, systemImage: "info.circle").font(look.type.callout).foregroundStyle(look.palette.inkSecondary)
         case .idle, .done:
-            renderButton
+            if settingsChanged { renderButton }
         }
+    }
+
+    /// The copy matches the current settings, so there's nothing to remake until something changes.
+    private var settingsChanged: Bool {
+        guard let enhanced, let provenance = store.derivativeProvenance(for: enhanced.id) else { return true }
+        return Int(provenance.strength * 100) != Int(strength) || provenance.processMusic == leaveMusic
     }
 
     private var renderButton: some View {

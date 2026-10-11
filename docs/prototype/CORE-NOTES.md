@@ -730,3 +730,79 @@ Progress fractions sum verified bytes plus every active file's received bytes ov
 Regression coverage includes ANE load failure succeeding on GPU, first-prediction failure through CPU, exhausted placements, independent component/revision preferences, cancellation, speaker-only failure preserving words, debug detail surviving Apple fallback and trace serialization, four simultaneous foreground transfers, byte-weighted progress, out-of-order completion, pause/resume, foreground-only refill, multi-file relaunch recovery, and actual URLSession task migration with suspended no-network test sessions.
 
 The required simulator Core suite (118 reported tests), Speech suite (25 reported tests), LocalModel suite (18 tests), and unsigned device app build pass. The standard Core/Speech suites each skip one opt-in test; the supplied public ASR cache/audio was also exercised separately with the real FluidAudio runtime. Exact commands and outcomes are in REVIEW. Physical iPhone 17 Pro/A19 Pro execution-plan recovery and live download speed/background scheduling remain unvalidated; the no-network agreement also prevents a fresh remote FluidAudio release resolution. No `SermonSet/`, `project.yml`, `web/`, `site/`, `server/`, or script edits; no commits.
+
+## Section 17 — Voice Focus preview API (2026-10-10)
+
+The exact UI-facing API is available from `SermonSetCore`:
+
+```swift
+public struct VoiceFocusPreview: Sendable, Equatable {
+    public var original: URL
+    public var focused: URL
+    public var start: TimeInterval
+    public var duration: TimeInterval
+}
+
+// @MainActor, on SermonStore
+public func previewVoiceFocus(
+    sermonID: UUID,
+    strength: Double,
+    processMusic: Bool,
+    around time: TimeInterval?
+) async throws -> VoiceFocusPreview
+```
+
+Pass the listener's playhead as `around`, or `nil` for automatic selection. The excerpt is 20 seconds, clamped to the saved original/imported/sample trim and decoded playable duration. Playhead requests clamp to the last complete excerpt when near the end; trims shorter than 20 seconds return their complete duration. Automatic selection starts at trim start + 30 seconds, rejects the full renderer's sustained music detections and near-silent windows, and requires audible audio in at least 75% of its 0.4-second blocks. For trims shorter than 50 seconds, it searches from trim start. When no eligible speech window exists, it throws a readable `SermonSetError` suggesting a playhead preview. Automatic selection skips music even when `processMusic` is true; a playhead request can explicitly preview music.
+
+Both paths use `VoiceFocusRenderer`, the same mono downmix, high-pass/presence filters, gate/compressor, sustained music bypass, strength, and four-times peak limiter. The preview aligns blocks with the full trim and warms filter/envelope state before the excerpt. The full render and preview now share a bounded whole-trim loudness estimate: up to twelve evenly distributed 1.2-second windows, K-weighted with the existing absolute/relative gating. The source sample cache is keyed by checksum + effective trim, with file size/mtime invalidation; it retains at most four source/trim analyses in memory. Settings-specific gains reuse those samples and are cached separately. Concurrent requests share an in-flight source estimate. Both paths apply that same estimated gain toward -16 LUFS, bounded to -30…+18 dB; the full copy's gain is no longer determined by an excerpt or a separate normalization decision. As an estimate, it does not promise exact -16 LUFS for every recording.
+
+`original` and `focused` are protected, backup-excluded, lossless mono PCM `.caf` files in `Caches/VoiceFocusPreview/<request UUID>/`. They have equal decoded lengths; the original excerpt receives only a linear gain matching the focused excerpt's integrated loudness. No `AudioAsset`, provenance, job, library document, or `lastError` is changed. Live stores use the app's Caches directory; test/preview stores isolate Caches under their own root. The original recording is only read.
+
+A newer call cancels the preceding request and deletes its pair. Cancel the caller's Swift `Task` to cancel a request when the listener leaves the preview. Superseded/cancelled requests throw `CancellationError` and cannot return stale files or delete the newer request's files. Store initialization removes leftover preview files, including those left by a terminated app. Treat the URLs as valid only until the next preview request or app launch.
+
+Accelerate performs the existing filter, spectral, loudness, and peak calculations in buffers; regression tests compare the filter/compressor, meter, and limiter with their scalar formulas. Tests also cover selection, music/quiet skipping, trim/playhead bounds, matched A/B loudness, agreement with a full-copy excerpt, gain cache/invalidation, cancellation races, temporary cleanup, original checksums, and unchanged library files/assets.
+
+The Debug macOS timing fixture (bundled 48 kHz AAC speech, 20-second playhead excerpts) measured **0.697 s cold**, **0.676 s with cached source/new settings**, and **0.483 s with cached gain**. Exact simulator results and commands are recorded in `docs/REVIEW.md`. These measurements are local fixture evidence; physical iPhone latency/listening has not been validated. Only `Packages/SermonSetCore` and these two documentation files are edited by this task; existing/concurrent UI work is preserved. No commits.
+
+## Section 18 — Automatic Voice Focus and listening preference (2026-10-10)
+
+Exact new public API names for Claude, exported by `SermonSetCore`:
+
+```swift
+// All SermonStore members are @MainActor.
+public var voiceFocusAfterRecording: Bool { get set } // persisted; default true
+public func processVoiceFocusAfterRecording(sermonID: UUID) async
+public func preferredListeningAssetID(for sermonID: UUID) -> UUID?
+public func preferredListeningAsset(for sermonID: UUID) -> AudioAsset?
+public func setPreferredListeningAsset(_ assetID: UUID?, for sermonID: UUID) throws
+
+// On ProcessingJobs (Codable):
+public var voiceFocus: JobState
+// Its existing initializer gains its final defaulted argument:
+public init(transcription: JobState = .idle, insights: JobState = .idle,
+            summary: JobState = .idle, voiceFocus: JobState = .idle)
+// On AudioDerivativeProvenance (Codable):
+public var madeAutomatically: Bool?
+```
+
+`processRecording(sermonID:)` retains its explicit transcription/notes behavior and now starts `processVoiceFocusAfterRecording(sermonID:)` alongside those stages when the new preference is on. Notes can finish and appear while Voice Focus is still `.running(progress: nil)`; the method returns after both branches settle. The renderer's duration probe, checksums, loudness analysis and DSP run off the main actor. A render failure leaves its listener-readable `.failed(message:)` on `store.jobs(for: sermonID).voiceFocus`, does not fail the notes pipeline, and does not replace `lastError` with an automatic-copy error. Store-owned tasks deduplicate overlapping calls and survive cancellation of the view's awaiter. The existing continued-processing lease cancels both branches on expiration. Interrupted Voice Focus work is journaled separately and resumes from the original on launch/foreground; completed copies are reused without changing a later listener choice. Terminal rendering failures require an explicit retry and do not loop on each launch.
+
+**Recorder integration for Claude:** the current recorder only calls `processRecording` inside its `summarizeAfterRecording` gate. Keep that explicit notes call, and add the Voice Focus-only call when automatic notes are off:
+
+```swift
+if store.summarizeAfterRecording {
+    Task { await store.processRecording(sermonID: sermon.id) }
+} else if store.voiceFocusAfterRecording {
+    Task { await store.processVoiceFocusAfterRecording(sermonID: sermon.id) }
+}
+```
+
+This package task does not edit the recorder or settings UI. Claude can bind a toggle directly to `voiceFocusAfterRecording` and show the independent `jobs(for:).voiceFocus` state. The standalone Voice Focus-only call has durable foreground/relaunch recovery but does not submit the summary's continued-processing lease. There are no new Info.plist keys or background modes in this slice.
+
+The automatic copy uses the original/imported source, strength **0.5**, `processMusic: false`, and the **full decoded recording** starting at zero, ignoring any saved sharing trim. Provenance has `madeAutomatically == true`; new manual copies have `false`, and older documents decode it as `nil` (treat as manual). Originals remain canonical and unchanged. Transcription, retranscription, Parakeet routing and Apple fallback still read the original/imported asset and store evidence on that timeline. Sharing retains its existing explicit derivative/trim selection and validation; the listening preference never selects sharing audio.
+
+`preferredListeningAssetID(for:)` returns the stored choice, which may refer to a now-missing asset. `preferredListeningAsset(for:)` resolves an available local choice, falling back to the canonical source if the choice or its file is absent; official choices still require current authorization. `setPreferredListeningAsset(_:for:)` accepts an available local asset belonging to that sermon, or `nil` to reset to canonical playback. `PlaybackController.load(sermonID:autoplay:)` resolves this preference, including a changed preference or missing copy on a repeated load. `selectAudioAsset(_:levelMatched:acknowledgeMomentShift:)` and `revertToOriginal()` persist explicit player choices. Listening positions remain original timestamps, including trimmed manual copies after reopening. Full automatic copies report `.original` alignment; trimmed copies report their source offset.
+
+`play(moment:)` keeps a preferred Voice Focus copy when it covers that moment and cites the moment's original source. A moment outside a trimmed copy uses the original temporarily, opening its full timeline if a saved sharing trim would hide that moment, without changing the preferred listening asset. Moment/note records keep their original anchors and times. A successful manual `renderVoiceFocus(sermonID:strength:processMusic:)` becomes preferred, removes superseded automatic metadata/files, and retains original and existing manual files. A manual render takes precedence over any in-flight automatic render; cancelled or older requests cannot save a stale copy or change preference. Explicit anchors on a deleted automatic copy move to its original at the same timestamps.
+
+Regression coverage includes preference defaults/persistence and legacy decoding, full-length recommended rendering despite a saved trim, provenance/checksums/anchors, slow-render notes completion, view cancellation/deduplication, independent failure/disable behavior, source switching and missing/removed-file fallback, moment alignment, manual file replacement and render races, original-only manual/automatic/retranscription paths including both ASR engines/fallback, interrupted-copy relaunch recovery, and deletion during rendering. Exact verification commands and outcomes are in `docs/REVIEW.md`; physical iPhone listening and background execution have not been exercised.

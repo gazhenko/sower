@@ -13,6 +13,7 @@ struct RootView: View {
     @State private var importError: SermonSetError?
     @State private var isImporting = false
     @State private var afterOnboarding: OnboardingNext?
+    @State private var chromeHeight: CGFloat = 0
 
     var body: some View {
         @Bindable var router = router
@@ -27,6 +28,8 @@ struct RootView: View {
                     .sermonDestinations()
             }
             .id(router.tab)
+            // The bar and mini player float over the tabs, so every scroll view ends clear of them.
+            .contentMargins(.bottom, chromeHeight + 12, for: .scrollContent)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 8) {
@@ -43,6 +46,7 @@ struct RootView: View {
                 BottomBar()
             }
             .padding(.horizontal, look.id == .rubric || look.id == .sower ? 0 : 16)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { chromeHeight = $0 }
             .animation(.snappy, value: capture.isActive)
             .animation(.snappy, value: playback.nowPlayingSermonID)
         }

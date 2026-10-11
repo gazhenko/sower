@@ -985,3 +985,144 @@ git diff --check -- Packages docs/prototype/CORE-NOTES.md docs/REVIEW.md
 **PASS, exit 0.** A task-start hash comparison confirms unchanged package manifests and no edits/additions in `SermonSet/`, root `project.yml`, `web/`, `site/`, `server/`, AGENTS.md, or scripts/dev.sh. Existing worktree changes are preserved. No commits, release signing, credential access, or shared-simulator changes. Generated projects, DerivedData, temporary fixtures, resume/preference files used by tests, and logs stay in ignored workspace directories.
 
 **BLOCKED / not performed:** physical iPhone 17 Pro/iOS 27/A19 Pro recovery, live foreground throughput and OS background scheduling/resume, and fresh remote FluidAudio 0.17.7 resolution. The physical environment was not exercised, and the working agreement prohibits requiring network access or installing dependencies. Passing local fake-loader/state checks, Mac cached inference, and device compilation do not establish those results.
+
+## Section 17 — Voice Focus preview API (2026-10-10)
+
+Implemented CORE-REQUESTS §17 in `Packages/SermonSetCore`, with the exact `VoiceFocusPreview` value and MainActor `SermonStore.previewVoiceFocus(sermonID:strength:processMusic:around:)` signature. Preview and full copy share their processing chain and the same cached whole-trim gain estimate. Temporary matched PCM pairs are protected, excluded from backup, removed on the next request/store initialization, and never inserted into the library. Cancellation propagates from callers and newer requests without publishing a stale result. CORE-NOTES documents the API, short-recording behavior, estimate/cache details, and URL lifetime.
+
+### Required final validation
+
+```sh
+scripts/dev.sh test > build/section17/dev-test-final.log 2>&1
+```
+
+**PASS, exit 0, TEST SUCCEEDED.** 126 reported tests in 22 suites, **33.437 seconds**, with the existing opt-in `nativeClientAgainstIsolatedWorker` test skipped (**125 executed**). All eight new preview tests pass. Includes actual public-API automatic selection from bundled AAC audio, invalid-input preservation, music/quiet skipping, trim/playhead bounds, matched A/B loudness, exact full-copy gain agreement and corresponding AAC excerpt level, cache reuse/invalidation, next-preview/startup cleanup, overlapping/caller cancellation, unchanged store bytes/assets/original checksum, and equivalence with scalar DSP/meter/limiter formulas.
+
+Exact wrapped command:
+
+```sh
+xcodebuild -project SermonSet.xcodeproj -scheme SermonSetCore -configuration Debug -destination 'platform=iOS Simulator,id=32502FB1-1CBE-4555-B1FE-CF1712B1A45C' -derivedDataPath /Users/jemmygazhenko/Documents/GitHub/sermonset-ios/build/DerivedData-core -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO -parallel-testing-enabled NO -resultBundlePath /Users/jemmygazhenko/Documents/GitHub/sermonset-ios/build/logs-core/tests-20261010-230712-89189.xcresult test
+```
+
+The script generated the ignored Xcode project and found the existing Codex task simulator already booted. No simulator creation, reset, reconfiguration, app installation/launch, or shared-simulator changes were performed. Declared app packages resolved through the available Xcode package cache; the first script run created its ignored FluidAudio 0.17.7 working copy. No dependency manifest edits, manual dependency/model installs, or credentials were needed. Core remains dependency-free.
+
+The timing test measured real 48 kHz AAC speech excerpts in the **Debug simulator**: **0.671 s cold**, **0.638 s with cached source/new settings**, **0.453 s with cached gain**, and **0.496 s for automatic selection with cached gain**. It prints timings rather than imposing a machine-dependent deadline. The earlier Debug macOS fixture measured 0.697 / 0.676 / 0.483 seconds respectively. These are fixture measurements, not a physical-iPhone latency guarantee. Loudness uses the documented bounded whole-trim estimate; both preview and full render use its exact gain, but the estimate/limiter/codec do not promise an exact final -16 LUFS for every source.
+
+### Focused and intermediate commands
+
+```sh
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter VoiceFocusTests > build/voice-focus-baseline.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter VoiceFocusTests > build/section17/core-initial.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'VoiceFocusTests|VoiceFocusPreviewTests' > build/section17/core-preview-seventh.log 2>&1
+scripts/dev.sh test > build/section17/dev-test.log 2>&1
+```
+
+**PASS, all exit 0.** Baseline: 4 tests, 12.732 seconds. Initial shared renderer: 4 tests, 5.984 seconds. Focused final implementation: 12 tests in 2 suites, 9.447 seconds. First simulator run: 126 reported tests in 22 suites, 33.444 seconds, same single opt-in skip. The required final run above adds assertions for real AAC automatic selection and invalid inputs preserving store state.
+
+These intermediate commands failed and were resolved before the passing checks:
+
+```sh
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'VoiceFocusTests|VoiceFocusPreviewTests' > build/section17/core-preview-tests.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter VoiceFocusPreviewTests > build/section17/core-preview-second.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter VoiceFocusPreviewTests > build/section17/core-preview-third.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'VoiceFocusTests|VoiceFocusPreviewTests' > build/section17/core-preview-fourth.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'VoiceFocusTests|VoiceFocusPreviewTests' > build/section17/core-preview-fifth.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter VoiceFocusPreviewTests > build/section17/core-preview-sixth.log 2>&1
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'realSamplePreviewLatency|matchedPairUsesWholeTrimGainAndLeavesStoreUntouched' > build/section17/core-timing.log 2>&1
+```
+
+All exited **1**. First/second: Swift could not type-check a compound test waveform expression; fourth: the same compiler limit in a spectral-power expression. Both expressions were split. Third: selection included the final 0.4 seconds of an already-detected music run; selection now carries sustained detections across rolling-window boundaries. That run also tried to encode a 16 kHz fixture using the existing 96 kbps AAC full renderer, yielding Core Audio error 560226676; the full-copy fixture now uses supported 48 kHz. Fifth/sixth/timing: the full-copy comparison used broadband synthetic noise, for which AAC changed the weighted level by 1.41 dB (0.60 dB after smoothing); the fixture now uses reproducible speech-band frequencies. The comparison's **0.25 LUFS tolerance was retained**, as was the separate exact gain equality assertion. Initial AAC preview latency was 1.66 s cold / 1.26 s for new settings; buffered native Accelerate calculations and the bounded estimate reduced it to the final timings above. Temporary timing instrumentation was removed from production sources.
+
+### Scope and remaining validation
+
+```sh
+git diff --check -- Packages/SermonSetCore docs/prototype/CORE-NOTES.md docs/REVIEW.md
+```
+
+**PASS, exit 0.** Task edits are limited to Core source/tests and the two requested documentation files. Existing/concurrent changes under `SermonSet/` and CORE-REQUESTS are preserved. This task made no edits to `SermonSet/`, `project.yml`, `web/`, `site/`, `server/`, scripts, or other package manifests. New fixtures, logs, generated projects and DerivedData are in ignored workspace directories. No commits, push, deployment, release signing, credential access, or coordinator changes.
+
+**BLOCKED / not performed:** physical iPhone preview listening, latency, interruptions and codec/acoustic validation; no physical iPhone was exercised. The passing simulator suite is not physical-device or app-launch evidence.
+
+## Section 18 — Automatic Voice Focus and preferred listening audio (2026-10-10)
+
+Implemented CORE-REQUESTS §18 in `Packages/SermonSetCore`. Automatic processing creates a full-length Voice Focus copy at strength 0.5 with `processMusic: false`, alongside transcription/notes, with independent job state and automatic provenance. The copy becomes the persisted listening choice; unavailable or removed choices fall back to canonical audio. Player choices persist, moments keep their original timeline, and manual rendering takes precedence and deletes superseded automatic files. Originals, transcription inputs, and sharing's explicit trim/selection rules are preserved. Cancelled copies resume from their original; terminal automatic failures remain readable and non-fatal. An initial capability-probe race exposed by the extra concurrent work is guarded so it cannot overwrite newer speech-asset readiness.
+
+Exact new public API names for Claude:
+
+```swift
+// SermonStore, @MainActor
+public var voiceFocusAfterRecording: Bool { get set }
+public func processVoiceFocusAfterRecording(sermonID: UUID) async
+public func preferredListeningAssetID(for sermonID: UUID) -> UUID?
+public func preferredListeningAsset(for sermonID: UUID) -> AudioAsset?
+public func setPreferredListeningAsset(_ assetID: UUID?, for sermonID: UUID) throws
+// ProcessingJobs
+public var voiceFocus: JobState
+public init(transcription: JobState = .idle, insights: JobState = .idle,
+            summary: JobState = .idle, voiceFocus: JobState = .idle)
+// AudioDerivativeProvenance
+public var madeAutomatically: Bool?
+```
+
+`processRecording(sermonID:)`, `renderVoiceFocus(sermonID:strength:processMusic:)`, and the public player signatures remain callable as before. CORE-NOTES §18 documents the saved-ID/resolved-asset distinction, old-provenance decoding, task ownership, moment behavior, background recovery, and the exact recorder integration for Claude. The current UI gates `processRecording` on automatic notes; Claude must add the independent `processVoiceFocusAfterRecording` call when notes are off. This task intentionally makes no app-source or settings-UI edits.
+
+### Required final validation
+
+```sh
+scripts/dev.sh test > build/section18/dev-test.log 2>&1
+```
+
+**PASS, exit 0, TEST SUCCEEDED.** **136 reported tests in 23 suites**, **91.497 seconds**; the existing opt-in `nativeClientAgainstIsolatedWorker` test is skipped (**135 executed**). All **10 new AutomaticVoiceFocusTests** pass. Coverage includes defaults/persistence/legacy decoding; recommended full-recording rendering despite a saved trim; checksums, provenance and anchors; notes finishing while the renderer is held; awaiter cancellation and deduplication; disable/non-fatal failure behavior; player source persistence and missing/removed-copy fallback; moments on full and trimmed sources; deletion of superseded automatic files; manual/automatic races; original-only manual/automatic ASR and retranscription with Parakeet/Apple/fallback; relaunch recovery; and deletion during rendering. Existing Voice Focus preview, speech-asset, summary/notes and playback regressions also pass.
+
+Exact script-wrapped command:
+
+```sh
+xcodebuild -project SermonSet.xcodeproj -scheme SermonSetCore -configuration Debug -destination 'platform=iOS Simulator,id=32502FB1-1CBE-4555-B1FE-CF1712B1A45C' -derivedDataPath /Users/jemmygazhenko/Documents/GitHub/sermonset-ios/build/DerivedData-core -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO -parallel-testing-enabled NO -resultBundlePath /Users/jemmygazhenko/Documents/GitHub/sermonset-ios/build/logs-core/tests-20261010-235058-98960.xcresult test
+```
+
+The script generated the ignored project and found the existing Codex task simulator already booted. No simulator was created, reset, reconfigured, or manually launched. This is simulator test evidence, not physical iPhone validation.
+
+```sh
+xcodebuild build -project SermonSet.xcodeproj -scheme SermonSet -destination 'generic/platform=iOS' -derivedDataPath build/codex-device -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO > build/section18/device-build.log 2>&1
+```
+
+**PASS, exit 0, BUILD SUCCEEDED.** Unsigned arm64 iOS app compilation includes the package API changes and the existing UI worktree. Xcode used the available dependency cache, including a cached FluidAudio 0.17.7 checkout under the ignored device DerivedData. No package dependencies were added, manifests changed, credentials accessed, or release signing performed. This command does not install or run the app on an iPhone.
+
+### Focused and intermediate checks
+
+```sh
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'VoiceFocusTests|SummaryTests|RecordingSpeechAssetsTests' > build/section18/core-initial.log 2>&1
+```
+
+**FAIL, exit 1:** 21 tests in three suites; two existing speech-asset assertions found `.needsDownload` after the pipeline had already downloaded/rechecked the assets. An initial asynchronous capability probe could publish a stale result after the newer processing result. Capability revisions now reject those late writes; transcription source selection and ASR behavior are unchanged.
+
+```sh
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'AutomaticVoiceFocusTests|VoiceFocusTests|SummaryTests|RecordingSpeechAssetsTests' > build/section18/core-focused.log 2>&1
+```
+
+**FAIL, exit 1:** the new test fixture's compound timestamp expression exceeded Swift's type-checking limit, and nested `#require` macros failed recursive expansion. Split the expression and unwrap provenance before encoding; no production behavior was changed for these compiler errors.
+
+```sh
+swift test --package-path Packages/SermonSetCore --disable-automatic-resolution --filter 'AutomaticVoiceFocusTests|VoiceFocusTests|SummaryTests|RecordingSpeechAssetsTests' > build/section18/core-focused-second.log 2>&1
+```
+
+**PASS, exit 0:** 31 tests in four suites, **10.973 seconds**, including all ten new tests and the previously failing speech-asset assertions. The subsequent required simulator suite additionally checks the final assertion that a moment outside a manual/sharing trim reaches its original timestamp.
+
+### Scope and remaining validation
+
+```sh
+git diff --check -- Packages/SermonSetCore docs/prototype/CORE-NOTES.md docs/REVIEW.md
+python3 - <<'PY'
+from pathlib import Path
+import hashlib, json
+expected = json.loads(Path('build/section18/protected-hashes.json').read_text())
+changed = [p for p, h in expected.items()
+           if not Path(p).exists() or hashlib.sha256(Path(p).read_bytes()).hexdigest() != h]
+assert not changed, changed
+print('Protected files match the task-start snapshot.')
+PY
+```
+
+**PASS, exit 0.** Task edits are limited to Core source/tests and the two requested documentation files. Task-start file hashes confirm preserved contents in `SermonSet/`, `project.yml`, `web/`, `site/`, `server/`, AGENTS.md and scripts/dev.sh. Existing package preview work and concurrent UI/document changes remain intact. New test fixtures, snapshots, logs, generated projects, and DerivedData are inside ignored workspace directories. No commits, push, deployment, release signing, credential access, or coordinator changes.
+
+**BLOCKED / not performed:** physical iPhone listening/latency, real microphone capture with the automatic pipeline, and OS background scheduling/expiration. This environment exercised local audio fixtures, simulator playback/tests and unsigned device compilation. The standalone Voice Focus-only call journals interrupted work for foreground/relaunch recovery; it does not submit the summary's continued-processing lease or require new app background configuration.

@@ -26,8 +26,10 @@ extension SermonStore {
         recordingBackground[sermonID] = lease
         lease.begin(enabled: configuration == .live, subtitle: transcript(for: sermonID) == nil ? "Transcribing on your iPhone" : "Drafting the summary") { [weak self] in
             self?.recordingTasks[sermonID]?.cancel()
+            self?.voiceFocusTasks[sermonID]?.cancel()
         }
         let task = Task { [self] in
+            async let focused: Void = processVoiceFocusAfterRecording(sermonID: sermonID)
             if transcript(for: sermonID) == nil {
                 await transcribe(sermonID: sermonID, preparingSpeechAssets: true)
                 await waitForProcessingStage(sermonID: sermonID, transcription: true)
@@ -39,6 +41,7 @@ extension SermonStore {
             }
             let completed = !Task.isCancelled && jobs(for: sermonID).insights == .done
             if completed { try? transaction { $0.pendingRecordingProcessing?.remove(sermonID) } }
+            await focused
             lease.finish(success: completed)
             recordingTasks[sermonID] = nil; recordingBackground[sermonID] = nil
         }
@@ -66,6 +69,10 @@ extension SermonStore {
         for id in document.pendingRecordingProcessing ?? [] where isInLibrary(id) {
             if Task.isCancelled { return }
             await processRecording(sermonID: id)
+        }
+        for id in document.pendingVoiceFocusRecordings ?? [] where isInLibrary(id) {
+            if Task.isCancelled { return }
+            await processVoiceFocusAfterRecording(sermonID: id)
         }
     }
     func observeProcessingForeground() {

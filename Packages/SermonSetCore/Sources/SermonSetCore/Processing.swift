@@ -6,8 +6,12 @@ extension SermonStore {
         var audioChecksum: String
     }
     public func refreshCapabilities() async {
+        let revision = capabilityRevision
         let adapter = await selectedTranscriptionAdapter()
         let speech = await adapter.capability()
+        // Initial/foreground probes may finish after an asset download or ASR
+        // readiness recheck. Keep that newer result when processing overlaps.
+        guard capabilityRevision == revision else { return }
         capabilities = CapabilityReport(speechTranscription: speech, onDeviceLanguageModel: insightsAdapter.capability())
     }
     public func prepareSpeechAssets() async throws {

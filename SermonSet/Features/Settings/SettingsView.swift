@@ -111,6 +111,16 @@ struct SettingsView: View {
                 }
             }
             .tint(look.palette.accent)
+            Toggle(isOn: Binding(get: { store.voiceFocusAfterRecording }, set: { store.voiceFocusAfterRecording = $0 })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Make a Voice Focus copy after recording").font(look.type.headline).foregroundStyle(look.palette.ink)
+                    Text("Clearer speech for listening, at the recommended 50% with music left alone. Your original is kept, and transcripts always use it because it’s more accurate for the transcriber.")
+                        .font(look.type.caption)
+                        .foregroundStyle(look.palette.inkTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .tint(look.palette.accent)
             TranscriptionEngineSection().padding(.top, 6)
             NotesEngineSection().padding(.top, 6)
             Text("If something isn’t available here, \(AppBrand.name) skips it. It never sends your audio to a server instead.")

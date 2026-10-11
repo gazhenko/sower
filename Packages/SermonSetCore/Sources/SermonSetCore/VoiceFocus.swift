@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Observation
+import Accelerate
 
 public enum AudioAlignment: Codable, Hashable, Sendable { case original, offset(seconds: Double), unavailable }
 
@@ -36,6 +37,8 @@ public struct AudioDerivativeProvenance: Codable, Hashable, Sendable {
     public var processMusic: Bool
     public var algorithm: String
     public var diagnostics: VoiceFocusDiagnostics
+    /// Absent on older derivatives, which were made manually.
+    public var madeAutomatically: Bool? = nil
 }
 struct CoreFeatures: Codable, Sendable {
     var officialSources: [UUID:OfficialSourceAuthorization]?
@@ -47,6 +50,7 @@ struct CoreFeatures: Codable, Sendable {
     var serverKeys: [ServerSigningKey]?
     var trims: [UUID: AudioTrimWindow] = [:]
     var derivatives: [UUID: AudioDerivativeProvenance] = [:]
+    var preferredListeningAssets: [UUID: UUID]?
     var locales: [UUID: String] = [:]
     var staleTakeaways: Set<UUID> = []
     var staleOutline: Set<UUID> = []
@@ -60,6 +64,17 @@ struct Biquad {
         let y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2
         x2 = x1; x1 = x; y2 = y1; y1 = y
         return y.isFinite ? y : 0
+    }
+    mutating func process(_ input: [Double]) -> [Double] {
+        guard !input.isEmpty else { return [] }
+        let coefficients = [b0, b1, b2, a1, a2]
+        guard let setup = vDSP_biquad_CreateSetupD(coefficients, 1) else { return input.map { sample($0) } }
+        defer { vDSP_biquad_DestroySetupD(setup) }
+        var delay = [x2, x1, y2, y1]
+        var output = [Double](repeating: 0, count: input.count)
+        vDSP_biquadD(setup, &delay, input, 1, &output, 1, vDSP_Length(input.count))
+        x2 = delay[0]; x1 = delay[1]; y2 = delay[2]; y1 = delay[3]
+        return output
     }
     static func highPass(rate: Double, hz: Double) -> Self {
         let w = 2 * Double.pi * hz / rate, c = cos(w), alpha = sin(w) / sqrt(2), d = 1 + alpha
@@ -94,21 +109,76 @@ struct SpeechDSP {
         let wet = filtered * gate * compression
         return Float(x * (1-strength) + wet * strength)
     }
-    static func limited(_ samples: [Float], gain: Double) -> [Float] {
-        // A conservative ceiling plus four-times cubic-interpolated intersample peak bounds.
-        let scaled = samples.map { Double($0.isFinite ? $0 : 0) * gain }
-        var peak = scaled.map(abs).max() ?? 0
-        if scaled.count > 3 {
-            for i in 1..<(scaled.count-2) {
-                let a = scaled[i-1], b = scaled[i], c = scaled[i+1], d = scaled[i+2]
-                for t in [0.25, 0.5, 0.75] {
-                    let y = b + 0.5*t*(c-a+t*(2*a-5*b+4*c-d+t*(3*(b-c)+d-a)))
-                    peak = max(peak, abs(y))
+    mutating func process(_ input: [Float], bypass: Bool) -> [Float] {
+        var values = [Double](repeating: 0, count: input.count)
+        input.withUnsafeBufferPointer { source in
+            values.withUnsafeMutableBufferPointer { destination in
+                for i in source.indices { destination[i] = source[i].isFinite ? Double(source[i]) : 0 }
+            }
+        }
+        let filtered = presence.process(highPass.process(values))
+        guard !input.isEmpty else { return [] }
+        var bases = [Double](repeating: 1, count: input.count), exponents = bases
+        let gateThreshold = pow(10.0, -48.0/20), compressionThreshold = pow(10.0, -18.0/20)
+        filtered.withUnsafeBufferPointer { wet in
+            bases.withUnsafeMutableBufferPointer { base in
+                exponents.withUnsafeMutableBufferPointer { exponent in
+                    for i in wet.indices {
+                        envelope = max(abs(wet[i]), envelope * release)
+                        if envelope < gateThreshold { base[i] = max(envelope, 1e-9)/gateThreshold; exponent[i] = 0.4*strength }
+                        else if envelope > compressionThreshold { base[i] = envelope/compressionThreshold; exponent[i] = -0.45*strength }
+                    }
                 }
             }
         }
-        let reduction = peak > 0.89 ? 0.89/peak : 1
-        return scaled.map { Float(max(-0.89, min(0.89, $0 * reduction))) }
+        if bypass || strength == 0 { return values.map { Float($0) } }
+        var gains = [Double](repeating: 0, count: input.count), count = Int32(input.count)
+        vvpow(&gains, exponents, bases, &count)
+        vDSP_vmulD(filtered, 1, gains, 1, &gains, 1, vDSP_Length(input.count))
+        var dry = 1-strength, wet = strength
+        vDSP_vsmulD(values, 1, &dry, &values, 1, vDSP_Length(input.count))
+        vDSP_vsmaD(gains, 1, &wet, values, 1, &values, 1, vDSP_Length(input.count))
+        var output = [Float](repeating: 0, count: input.count)
+        vDSP_vdpsp(values, 1, &output, 1, vDSP_Length(input.count))
+        return output
+    }
+    static func limited(_ samples: [Float], gain: Double) -> [Float] {
+        // A conservative ceiling plus four-times cubic-interpolated intersample peak bounds.
+        var scaled = [Double](repeating: 0, count: samples.count)
+        samples.withUnsafeBufferPointer { source in
+            scaled.withUnsafeMutableBufferPointer { destination in
+                for i in source.indices { destination[i] = Double(source[i].isFinite ? source[i] : 0) * gain }
+            }
+        }
+        guard !scaled.isEmpty else { return [] }
+        var peak = 0.0
+        vDSP_maxmgvD(scaled, 1, &peak, vDSP_Length(scaled.count))
+        if scaled.count > 3 {
+            scaled.withUnsafeBufferPointer { values in
+                let n = vDSP_Length(scaled.count-3), base = values.baseAddress!
+                var interpolated = [Double](repeating: 0, count: Int(n))
+                for t in [0.25, 0.5, 0.75] {
+                    var a = -0.5*t+t*t-0.5*t*t*t
+                    var b = 1-2.5*t*t+1.5*t*t*t
+                    var c = 0.5*t+2*t*t-1.5*t*t*t
+                    var d = -0.5*t*t+0.5*t*t*t
+                    vDSP_vsmulD(base, 1, &a, &interpolated, 1, n)
+                    vDSP_vsmaD(base+1, 1, &b, interpolated, 1, &interpolated, 1, n)
+                    vDSP_vsmaD(base+2, 1, &c, interpolated, 1, &interpolated, 1, n)
+                    vDSP_vsmaD(base+3, 1, &d, interpolated, 1, &interpolated, 1, n)
+                    var candidate = 0.0
+                    vDSP_maxmgvD(interpolated, 1, &candidate, n)
+                    peak = max(peak, candidate)
+                }
+            }
+        }
+        var reduction = peak > 0.89 ? 0.89/peak : 1
+        vDSP_vsmulD(scaled, 1, &reduction, &scaled, 1, vDSP_Length(scaled.count))
+        var lower = -0.89, upper = 0.89
+        vDSP_vclipD(scaled, 1, &lower, &upper, &scaled, 1, vDSP_Length(scaled.count))
+        var output = [Float](repeating: 0, count: samples.count)
+        vDSP_vdpsp(scaled, 1, &output, 1, vDSP_Length(scaled.count))
+        return output
     }
 }
 struct LoudnessMeter {
@@ -126,6 +196,22 @@ struct LoudnessMeter {
         sum += y*y; count += 1
         if count == blockFrames { blocks.append(sum/Double(count)); sum = 0; count = 0 }
     }
+    mutating func add(_ samples: [Float]) {
+        guard !samples.isEmpty else { return }
+        var values = [Double](repeating: 0, count: samples.count)
+        vDSP_vspdp(samples, 1, &values, 1, vDSP_Length(samples.count))
+        let filtered = hp.process(shelf.process(values))
+        filtered.withUnsafeBufferPointer { values in
+            var offset = 0
+            while offset < values.count {
+                let frames = min(blockFrames-count, values.count-offset)
+                var energy = 0.0
+                vDSP_svesqD(values.baseAddress!+offset, 1, &energy, vDSP_Length(frames))
+                sum += energy; count += frames; offset += frames
+                if count == blockFrames { blocks.append(sum/Double(count)); sum = 0; count = 0 }
+            }
+        }
+    }
     var lufs: Double? {
         let all = blocks + (count > 0 ? [sum/Double(count)] : [])
         let absolute = all.filter { -0.691 + 10*log10(max($0, 1e-15)) > -70 }
@@ -140,23 +226,36 @@ enum VoiceFocusRenderer {
     static func likelyMusic(_ samples: [Float], rate: Double) -> Bool {
         guard samples.count >= 512 else { return false }
         let n = 512, stride = max(1, samples.count/n)
+        let window = (0..<n).map { i in
+            Double(samples[min(samples.count-1,i*stride)]) * (0.5-0.5*cos(2*Double.pi*Double(i)/Double(n-1)))
+        }
         var energies: [Double] = []
-        for bin in 2..<64 {
-            let coefficient = 2*cos(2*Double.pi*Double(bin)/Double(n))
-            var a = 0.0, b = 0.0
-            for i in 0..<n {
-                let x = Double(samples[min(samples.count-1,i*stride)]) * (0.5-0.5*cos(2*Double.pi*Double(i)/Double(n-1)))
-                let next = x + coefficient*a-b; b = a; a = next
+        if let setup = vDSP_DFT_zop_CreateSetupD(nil, vDSP_Length(n), .FORWARD) {
+            defer { vDSP_DFT_DestroySetupD(setup) }
+            let imaginary = [Double](repeating: 0, count: n)
+            var real = imaginary, imag = imaginary
+            vDSP_DFT_ExecuteD(setup, window, imaginary, &real, &imag)
+            energies = (2..<64).map { i in
+                let power = real[i]*real[i] + imag[i]*imag[i]
+                return max(1e-12, power)
             }
-            energies.append(max(1e-12,a*a+b*b-coefficient*a*b))
+        } else {
+            for bin in 2..<64 {
+                let coefficient = 2*cos(2*Double.pi*Double(bin)/Double(n))
+                var a = 0.0, b = 0.0
+                for x in window { let next = x + coefficient*a-b; b = a; a = next }
+                energies.append(max(1e-12,a*a+b*b-coefficient*a*b))
+            }
         }
         let total = energies.reduce(0,+), mean = total/Double(energies.count)
         let flatness = exp(energies.map(log).reduce(0,+)/Double(energies.count))/mean
         let tonal = energies.sorted(by: >).prefix(3).reduce(0,+)/total
-        let rms = sqrt(samples.reduce(0) { $0+Double($1*$1) }/Double(samples.count))
+        var meanSquare: Float = 0
+        vDSP_measqv(samples, 1, &meanSquare, vDSP_Length(samples.count))
+        let rms = sqrt(Double(meanSquare))
         return rms > 0.015 && (flatness > 0.65 || tonal > 0.65)
     }
-    @concurrent static func render(source: URL, destination: URL, trim: AudioTrimWindow, strength: Double, processMusic: Bool) async throws -> (AudioFileInfo, VoiceFocusDiagnostics) {
+    @concurrent static func render(source: URL, destination: URL, trim: AudioTrimWindow, strength: Double, processMusic: Bool, gainDB: Double? = nil) async throws -> (AudioFileInfo, VoiceFocusDiagnostics) {
         let sourceHash = try LocalFiles.checksum(source)
         let input = try AVAudioFile(forReading: source, commonFormat: .pcmFormatFloat32, interleaved: false)
         let rate = input.processingFormat.sampleRate
@@ -176,9 +275,7 @@ enum VoiceFocusRenderer {
             let offset = Double(input.framePosition-start)/rate
             try input.read(into: buffer, frameCount: AVAudioFrameCount(min(Int64(capacity),start+frames-input.framePosition)))
             guard buffer.frameLength > 0, let channels = buffer.floatChannelData else { break }
-            let mono = (0..<Int(buffer.frameLength)).map { i in
-                (0..<Int(input.processingFormat.channelCount)).reduce(Float(0)) { $0+channels[$1][i] }/Float(input.processingFormat.channelCount)
-            }
+            let mono = VoiceFocusPCM.mono(buffer, channels: channels)
             clipped += mono.filter { abs($0) >= 0.999 }.count
             let silent = mono.allSatisfy { abs($0) < 0.00001 }
             if silent { silentFrames += mono.count }
@@ -201,18 +298,16 @@ enum VoiceFocusRenderer {
             try input.read(into: buffer, frameCount: AVAudioFrameCount(min(Int64(capacity),start+frames-input.framePosition)))
             guard buffer.frameLength > 0, let channels = buffer.floatChannelData else { break }
             processed.frameLength = buffer.frameLength
-            for i in 0..<Int(buffer.frameLength) {
-                let x = (0..<Int(input.processingFormat.channelCount)).reduce(Float(0)) { $0+channels[$1][i] }/Float(input.processingFormat.channelCount)
-                let time = offset+Double(i)/rate
-                let bypass = !processMusic && music.contains { time >= $0.start && time < $0.end }
-                let y = dsp.process(x, bypass: bypass)
-                processed.floatChannelData![0][i] = y; meter.add(y); originalMeter.add(x)
-            }
+            let mono = VoiceFocusPCM.mono(buffer, channels: channels)
+            let bypass = !processMusic && music.contains { offset >= $0.start && offset < $0.end }
+            let values = dsp.process(mono, bypass: bypass)
+            values.withUnsafeBufferPointer { processed.floatChannelData![0].update(from: $0.baseAddress!, count: $0.count) }
+            meter.add(values); originalMeter.add(mono)
             try output!.write(from: processed)
         }
         output = nil
         let inputLUFS = originalMeter.lufs, preLUFS = meter.lufs
-        let gainDB = max(-30,min(18,-16-(preLUFS ?? -16))), gain = pow(10,gainDB/20)
+        let gainDB = gainDB ?? max(-30,min(18,-16-(preLUFS ?? -16))), gain = pow(10,gainDB/20)
         let pcm = try AVAudioFile(forReading: intermediate)
         let pcmBuffer = AVAudioPCMBuffer(pcmFormat: pcm.processingFormat, frameCapacity: capacity)!
         var settings = AudioFiles.aacSettings; settings[AVSampleRateKey] = rate
@@ -221,7 +316,9 @@ enum VoiceFocusRenderer {
         while pcm.framePosition < pcm.length {
             try Task.checkCancellation(); try pcm.read(into: pcmBuffer)
             let values = SpeechDSP.limited(Array(UnsafeBufferPointer(start: pcmBuffer.floatChannelData![0], count: Int(pcmBuffer.frameLength))), gain: gain)
-            for (i,y) in values.enumerated() { pcmBuffer.floatChannelData![0][i] = y; finalMeter.add(y); peak = max(peak,Double(abs(y))) }
+            values.withUnsafeBufferPointer { pcmBuffer.floatChannelData![0].update(from: $0.baseAddress!, count: $0.count) }
+            finalMeter.add(values)
+            peak = max(peak, Double(values.map(abs).max() ?? 0))
             try final!.write(from: pcmBuffer)
         }
         final = nil; try LocalFiles.protect(destination)
@@ -243,23 +340,64 @@ extension SermonStore {
         try transaction { if $0.features == nil { $0.features = CoreFeatures() }; $0.features?.trims[assetID] = window }
     }
     @discardableResult public func renderVoiceFocus(sermonID: UUID, strength: Double = 0.5, processMusic: Bool = false) async throws -> AudioAsset {
-        guard strength.isFinite, (0...1).contains(strength), let source = audioAssets(for: sermonID).first(where: { [.original,.imported,.sample].contains($0.kind) }), let url = audioURL(for: source) else { throw report(SermonSetError(title: "Original unavailable", message: "Choose an original recording and strength from 0 to 100 percent.")) }
-        let requested = trimWindow(for: source.id) ?? AudioTrimWindow(start: 0,end: source.duration)
-        let duration = playableDuration(for: source)
-        try requested.validate(duration: duration)
-        let trim = AudioTrimWindow(start: requested.start,end: min(requested.end,duration))
+        voiceFocusTasks[sermonID]?.cancel()
+        return try await renderVoiceFocus(sermonID: sermonID, strength: strength, processMusic: processMusic, automatically: false)
+    }
+    func renderVoiceFocus(sermonID: UUID, strength: Double, processMusic: Bool, automatically: Bool) async throws -> AudioAsset {
+        let request = UUID(); voiceFocusRenderRequests[sermonID] = request
+        processingJobs[sermonID, default: ProcessingJobs()].voiceFocus = .running(progress: nil)
+        defer { if voiceFocusRenderRequests[sermonID] == request { voiceFocusRenderRequests[sermonID] = nil } }
         let id = UUID(), destination = recordingsDirectory.appendingPathComponent("\(id).m4a")
         do {
-            let (info, diagnostics) = try await VoiceFocusRenderer.render(source: url,destination: destination,trim: trim,strength: strength,processMusic: processMusic)
+            try Task.checkCancellation()
+            guard strength.isFinite, (0...1).contains(strength), let source = audioAssets(for: sermonID).first(where: { [.original,.imported,.sample].contains($0.kind) }), let url = audioURL(for: source) else { throw SermonSetError(title: "Original unavailable", message: "Choose an original recording and strength from 0 to 100 percent.") }
+            let sourceInfo = try await AudioFiles.inspect(url)
+            let duration = sourceInfo.duration
+            let requested = automatically ? AudioTrimWindow(start: 0, end: duration) : trimWindow(for: source.id) ?? AudioTrimWindow(start: 0, end: source.duration)
+            try requested.validate(duration: duration)
+            let trim = AudioTrimWindow(start: requested.start, end: min(requested.end, duration))
+            let gainDB = try await voiceFocusAnalysis.gain(source: url, checksum: source.checksumSHA256, trim: trim, strength: strength, processMusic: processMusic)
+            let (info, diagnostics) = try await voiceFocusRender(url, destination, trim, strength, processMusic, gainDB)
+            try Task.checkCancellation()
+            guard voiceFocusRenderRequests[sermonID] == request else { throw CancellationError() }
             let asset = AudioAsset(id: id,sermonID: sermonID,kind: .enhanced,duration: info.duration,byteCount: info.byteCount,checksumSHA256: info.checksum,sourceAudioAssetID: source.id)
-            let provenance = AudioDerivativeProvenance(sourceAssetID: source.id,sourceChecksum: try LocalFiles.checksum(url),trim: trim,strength: strength,processMusic: processMusic,algorithm: "VoiceFocus-v1 / K-weighted gated normalization / 4x peak estimate",diagnostics: diagnostics)
+            let provenance = AudioDerivativeProvenance(sourceAssetID: source.id,sourceChecksum: sourceInfo.checksum,trim: trim,strength: strength,processMusic: processMusic,algorithm: "VoiceFocus-v1 / K-weighted gated normalization / 4x peak estimate",diagnostics: diagnostics,madeAutomatically: automatically)
+            let superseded = automatically ? [] : audioAssets(for: sermonID).filter {
+                $0.kind == .enhanced && derivativeProvenance(for: $0.id)?.madeAutomatically == true
+            }
+            let supersededPaths = superseded.compactMap { document.audioPaths[$0.id] }
             try transaction {
-                guard $0.sermons[sermonID] != nil else { throw CancellationError() }
+                guard $0.sermons[sermonID] != nil, $0.audio[source.id] != nil else { throw CancellationError() }
                 $0.audio[id] = asset; $0.audioPaths[id] = destination.lastPathComponent
                 if $0.features == nil { $0.features = CoreFeatures() }; $0.features?.derivatives[id] = provenance
+                if $0.features?.preferredListeningAssets == nil { $0.features?.preferredListeningAssets = [:] }
+                $0.features?.preferredListeningAssets?[sermonID] = id
+                $0.pendingVoiceFocusRecordings?.remove(sermonID)
+                for old in superseded {
+                    // Automatic copies share the original timeline, so any explicit
+                    // anchors on one can safely retain their times on the original.
+                    for key in $0.moments.keys where $0.moments[key]?.audioAssetID == old.id { $0.moments[key]?.audioAssetID = source.id }
+                    for key in $0.notes.keys where $0.notes[key]?.audioAssetID == old.id { $0.notes[key]?.audioAssetID = source.id }
+                    $0.audio[old.id] = nil; $0.audioPaths[old.id] = nil
+                    $0.features?.derivatives[old.id] = nil; $0.features?.trims[old.id] = nil
+                }
             }
+            // Commit the replacement before deleting only the superseded automatic
+            // files. Original/imported/sample files never enter this list.
+            for path in supersededPaths {
+                let oldURL = recordingsDirectory.appendingPathComponent(path)
+                if FileManager.default.fileExists(atPath: oldURL.path) { try FileManager.default.removeItem(at: oldURL) }
+            }
+            processingJobs[sermonID, default: ProcessingJobs()].voiceFocus = .done
             return asset
-        } catch { try? FileManager.default.removeItem(at: destination); throw report(error) }
+        } catch {
+            if document.audio[id] == nil { try? FileManager.default.removeItem(at: destination) }
+            if voiceFocusRenderRequests[sermonID] == request, isInLibrary(sermonID) {
+                processingJobs[sermonID, default: ProcessingJobs()].voiceFocus = error is CancellationError ? .idle : .failed(message: Self.error(error).message)
+            }
+            if error is CancellationError || automatically { throw error }
+            throw report(error)
+        }
     }
 }
 @MainActor @Observable public final class VoiceFocusController {

@@ -25,6 +25,8 @@ public enum StoreConfiguration: Sendable, Hashable {
 struct StoreDocument: Codable, Sendable {
     var schemaVersion = 1
     var summarizeAfterRecording: Bool?
+    var voiceFocusAfterRecording: Bool?
+    var pendingVoiceFocusRecordings: Set<UUID>?
     var notesEngine: NotesEngineChoice?
     var transcriptionEngine: TranscriptionEngineChoice?
     var pendingRecordingProcessing: Set<UUID>?

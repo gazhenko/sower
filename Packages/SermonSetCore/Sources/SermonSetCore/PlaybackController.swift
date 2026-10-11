@@ -44,42 +44,41 @@ import MediaPlayer
         observeSession(); configureRemoteCommands()
     }
     public func load(sermonID: UUID, autoplay: Bool) {
-        if nowPlayingSermonID == sermonID, player != nil || remotePlayer != nil {
+        if nowPlayingSermonID == sermonID, remotePlayer != nil || (player != nil && activeAssetID == store.preferredListeningAsset(for: sermonID)?.id) {
             if autoplay { play() } else { pause() }
             return
         }
         stop()
         nowPlayingSermonID = sermonID
-        guard let sermon = store.sermon(sermonID), ![RightsState.noAudio, .audioRemoved, .disputed].contains(sermon.rightsState), let id = sermon.canonicalAudioAssetID, let asset = store.audioAssets(for: sermonID).first(where: { $0.id == id }), let url = store.audioURL(for: asset) else {
+        guard let sermon = store.sermon(sermonID), ![RightsState.noAudio, .audioRemoved, .disputed].contains(sermon.rightsState), let asset = store.preferredListeningAsset(for: sermonID), let url = store.audioURL(for: asset) else {
             isAudioUnavailable = true; return
         }
         do {
             let player = try AVAudioPlayer(contentsOf: url)
             player.enableRate = true; player.rate = rate; player.delegate = self
             player.prepareToPlay()
-            let trim = store.trimWindow(for: asset.id)
-            lowerBound = trim?.start ?? 0; duration = min(player.duration,trim?.end ?? player.duration)
+            configureLocalTimeline(asset: asset, player: player, timestamp: store.entry(for: sermonID)?.history.listeningPosition ?? 0)
             activeAssetID = asset.id; activeAssetKind = asset.kind; isAudioUnavailable = false
-            currentTime = max(lowerBound, min(store.entry(for: sermonID)?.history.listeningPosition ?? lowerBound, duration))
-            player.currentTime = currentTime; self.player = player
+            self.player = player
             updateNowPlaying()
             if autoplay { play() }
         } catch { isAudioUnavailable = true; _ = store.report(SermonSetError(title: "Audio could not be played", message: error.localizedDescription)) }
     }
     /// Same source timestamp for Original/Voice Focus; level matching attenuates the louder source.
     public func selectAudioAsset(_ assetID: UUID, levelMatched: Bool = true, acknowledgeMomentShift: Bool = false) throws {
+        try selectAudioAsset(assetID, levelMatched: levelMatched, acknowledgeMomentShift: acknowledgeMomentShift, rememberPreference: true)
+    }
+    private func selectAudioAsset(_ assetID: UUID, levelMatched: Bool, acknowledgeMomentShift: Bool, rememberPreference: Bool) throws {
         guard let sermonID = nowPlayingSermonID, let asset = store.audioAssets(for: sermonID).first(where: { $0.id == assetID }), let url = store.audioURL(for: asset) else { throw SermonSetError(title: "Audio unavailable", message: "Open a local sermon before comparing audio.") }
         if asset.kind == .official { try store.requireOfficialAuthorization(asset.id) }
         if asset.kind == .official && !acknowledgeMomentShift { throw SermonSetError(title: "Your moments may shift",message: "Confirm the switch to official audio. Your existing marked moments stay attached to their original source.") }
         let provenance = store.derivativeProvenance(for: assetID)
-        let playing = isPlaying, timestamp = currentTime
-        pause()
         let next = try AVAudioPlayer(contentsOf: url)
         next.enableRate = true; next.rate = rate; next.delegate = self; next.prepareToPlay()
-        sourceOffset = provenance?.trim.start ?? 0
-        let trim = provenance?.trim ?? store.trimWindow(for: assetID)
-        lowerBound = trim?.start ?? 0; duration = trim?.end ?? next.duration
-        currentTime = max(lowerBound,min(timestamp,duration)); next.currentTime = currentTime-sourceOffset
+        if rememberPreference, store.isInLibrary(sermonID) { try store.setPreferredListeningAsset(assetID, for: sermonID) }
+        let playing = isPlaying, timestamp = currentTime
+        pause()
+        configureLocalTimeline(asset: asset, player: next, timestamp: timestamp)
         if levelMatched {
             let reference = store.audioAssets(for: sermonID).compactMap { store.derivativeProvenance(for: $0.id)?.diagnostics }.last
             let original = reference?.inputLUFS ?? -16, enhanced = reference?.outputLUFS ?? -16
@@ -88,8 +87,17 @@ import MediaPlayer
         }
         remotePlayer = nil; remoteExpiry = nil; remoteGeneration = UUID()
         player = next; activeAssetID = assetID; activeAssetKind = asset.kind; isAudioUnavailable = false
-        alignment = asset.kind == .official ? .unavailable : provenance.map { .offset(seconds: $0.trim.start) } ?? .original
         if playing { play() }; updateNowPlaying()
+    }
+    private func configureLocalTimeline(asset: AudioAsset, player: AVAudioPlayer, timestamp: TimeInterval) {
+        let provenance = store.derivativeProvenance(for: asset.id)
+        sourceOffset = provenance?.trim.start ?? 0
+        let trim = provenance?.trim ?? store.trimWindow(for: asset.id)
+        lowerBound = trim?.start ?? 0
+        duration = min(sourceOffset + player.duration, trim?.end ?? player.duration)
+        currentTime = max(lowerBound, min(timestamp, duration))
+        player.currentTime = currentTime - sourceOffset
+        alignment = asset.kind == .official ? .unavailable : (sourceOffset == 0 ? .original : .offset(seconds: sourceOffset))
     }
     public func playCommunity(sermonID: String, localID: UUID, community: CommunityController, from time: TimeInterval = 0) async throws {
         let token = remoteGeneration
@@ -141,7 +149,15 @@ import MediaPlayer
     }
     public func play(moment: MarkedMoment) throws {
         load(sermonID: moment.sermonID,autoplay: false)
-        if let source = moment.audioAssetID, source != activeAssetID { try selectAudioAsset(source,levelMatched: false,acknowledgeMomentShift: true) }
+        if let source = moment.audioAssetID, source != activeAssetID {
+            let focused = activeAssetID.flatMap { store.derivativeProvenance(for: $0) }
+            let aligned = focused?.sourceAssetID == source && moment.time >= lowerBound && moment.time <= duration
+            if !aligned { try selectAudioAsset(source,levelMatched: false,acknowledgeMomentShift: true,rememberPreference: false) }
+        }
+        if let player, let kind = activeAssetKind, [.original, .imported, .sample].contains(kind), moment.time < lowerBound || moment.time > duration {
+            // A saved sharing trim must not hide a moment on the full original.
+            lowerBound = 0; sourceOffset = 0; duration = player.duration; alignment = .original
+        }
         seek(to: moment.time); play()
     }
     public func revertToOriginal() throws {

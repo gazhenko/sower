@@ -467,3 +467,55 @@ int8 encoder that fails to build an execution plan on A16 (#828), so suspect an 
 
 Add tests (fake loader that fails on ANE and succeeds on GPU; diarization-only failure; parallel foreground download
 state). Build for device; document in CORE-NOTES and REVIEW.
+
+## 17. Voice Focus preview before rendering the whole copy (from Claude; owner request)
+
+The owner wants to hear Voice Focus before committing to a full copy. Add:
+
+```swift
+public struct VoiceFocusPreview: Sendable, Equatable {
+    public var original: URL      // temporary, Caches/VoiceFocusPreview/, deleted on the next preview or app launch
+    public var focused: URL
+    public var start: TimeInterval  // where the excerpt begins in the recording
+    public var duration: TimeInterval
+}
+@MainActor extension SermonStore {   // or VoiceFocusController, wherever render lives
+    public func previewVoiceFocus(sermonID: UUID, strength: Double, processMusic: Bool, around time: TimeInterval?) async throws -> VoiceFocusPreview
+}
+```
+
+- Excerpt: 20 s. If `time` is given (the listener's playhead), start there (clamped to the trim window). Otherwise pick the
+  first 20 s of steady speech after the trim start + 30 s (skip windows the music detector flags and near-silent ones).
+- Render the excerpt with exactly the same chain and settings as the full copy (`VoiceFocusRenderer`, same
+  strength/processMusic). For loudness, apply the gain the full render *would* use: estimate the whole-recording
+  integrated loudness once per source (cache it keyed by source checksum + trim) so the preview's level matches the final
+  copy; also write the original excerpt loudness-matched to the focused one, so A/B compares tone, not volume.
+- Fast: should return in well under a second for 20 s; never touches the original, never creates an `AudioAsset`,
+  never writes to the store. Cancellable; a newer preview request cancels an older one.
+
+Tests: excerpt selection (playhead, trim clamping, music skip), loudness-matched pair, temp cleanup, no store changes.
+Document in CORE-NOTES.
+
+## 18. Make a Voice Focus copy automatically after recording, and listen to it by default (owner request)
+
+The owner wants the Voice Focus copy made for them after every recording, at the recommended settings, while the
+original stays as the base. Measured first (`build/asr-lab/voicefocus_lab.swift`, same chain at strength 0.5): Voice
+Focus does **not** help transcription — Parakeet 18.3 → 18.8 % (AMI long-form) and 3.5 → 3.7 % (LibriSpeech long-form);
+Apple 28.6 → 28.7 % and 4.7 → 5.3 %. So transcription keeps reading the original; Voice Focus is for listening.
+
+1. `SermonStore.voiceFocusAfterRecording: Bool` (persisted, default `true`).
+2. In `processRecording`, when on: render Voice Focus from the original at strength 0.5 with music left untouched
+   (`processMusic: false`), over the full recording (no trim, so the timeline matches the original and moments stay
+   aligned). Run it alongside transcription/notes — never delay notes, never feed it to transcription — with its own
+   `ProcessingJobs.voiceFocus` state. A failure here is non-fatal and leaves a readable reason. Record provenance that
+   it was made automatically.
+3. Listening preference: a persisted per-sermon preferred listening asset. When the automatic copy is created it becomes
+   the preferred one; `PlaybackController.load` plays the preferred asset (falling back to the canonical original if it's
+   missing or removed); choosing a source in the player updates the preference. Moments, listening position, and
+   sharing keep working (sharing still uses its own trim/selection rules).
+4. Re-rendering Voice Focus manually (different strength or after a trim) replaces the automatic copy as the preferred
+   asset and deletes the superseded automatic copy's file (originals are never deleted).
+5. `retranscribe` and every transcription path keep using the original/imported asset.
+
+Tests: default on and persisted; render scheduled after recording without blocking notes; preference default + switch +
+fallback; moments aligned; manual re-render supersedes; transcription source unchanged. Document in CORE-NOTES.

@@ -74,6 +74,10 @@ enum DebugLaunchRoute {
                       store.transcriptionFallbackReason ?? "-", store.lastError?.message ?? "-",
                       store.transcript(for: sermon.id).map { "\($0.engine), \($0.segments.count) segments" } ?? "none")
             }
+        case "card-art-lab":
+            #if DEBUG
+            Task { await CardArtLab.run(store: store) }
+            #endif
         case "insights-demo":
             // Regenerates takeaways for a sample from its transcript with whatever on-device model is available.
             guard let first else { return }

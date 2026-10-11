@@ -19,7 +19,7 @@ struct SermonNotesSection: View {
         let insights = store.insights(for: sermon.id)
         if canEdit || insights?.notes != nil {
             VStack(alignment: .leading, spacing: 18) {
-                LookSectionHeader("Sermon notes", trailing: insights?.notes.map { AnyView(stateBadge($0)) })
+                LookSectionHeader("Sermon notes")
                 if let notes = insights?.notes {
                     if store.jobs(for: sermon.id).summary.isRunning {
                         NotesProgress(sermonID: sermon.id)
@@ -127,12 +127,6 @@ struct SermonNotesSection: View {
         }
     }
 
-    private func stateBadge(_ notes: SermonNotes) -> some View {
-        Text(sermon.isSample ? "Sample" : notes.reviewState == .reviewed ? "Kept" : "Draft")
-            .font(look.type.caption)
-            .foregroundStyle(!sermon.isSample && notes.reviewState == .reviewed ? look.palette.positive : look.palette.inkTertiary)
-    }
-
     private func actions(_ notes: SermonNotes) -> some View {
         let onCard = sermon.summary == notes.bigIdea
         return VStack(alignment: .leading, spacing: 12) {
@@ -151,9 +145,6 @@ struct SermonNotesSection: View {
                 .buttonStyle(.look(.secondary))
             }
             HStack(spacing: 16) {
-                if notes.reviewState == .draft && !sermon.isSample {
-                    Button("Keep") { perform { try store.setNotesReview(sermonID: sermon.id, state: .reviewed) } }
-                }
                 Button("Edit") { isEditing = true }
                 Button("Write again") { notes.isEdited ? (confirmRedo = true) : redo() }
                     .accessibilityHint("Apple Intelligence reads the transcript again and writes new notes")

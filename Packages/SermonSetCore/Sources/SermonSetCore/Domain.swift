@@ -461,16 +461,19 @@ public struct ProcessingJobs: Codable, Hashable, Sendable {
     public var transcription: JobState
     public var insights: JobState
     public var summary: JobState
-    public init(transcription: JobState = .idle, insights: JobState = .idle, summary: JobState = .idle) {
+    public var voiceFocus: JobState
+    public init(transcription: JobState = .idle, insights: JobState = .idle, summary: JobState = .idle, voiceFocus: JobState = .idle) {
         self.transcription = transcription
         self.insights = insights; self.summary = summary
+        self.voiceFocus = voiceFocus
     }
-    private enum CodingKeys: String, CodingKey { case transcription, insights, summary }
+    private enum CodingKeys: String, CodingKey { case transcription, insights, summary, voiceFocus }
     public init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         transcription = try values.decode(JobState.self, forKey: .transcription)
         insights = try values.decode(JobState.self, forKey: .insights)
         summary = try values.decodeIfPresent(JobState.self, forKey: .summary) ?? .idle
+        voiceFocus = try values.decodeIfPresent(JobState.self, forKey: .voiceFocus) ?? .idle
     }
 }
 
